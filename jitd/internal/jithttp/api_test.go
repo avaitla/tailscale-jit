@@ -52,10 +52,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *fakeTS) {
 // newTestServerWith lets a test adjust the Server before it is served.
 func newTestServerWith(t *testing.T, adjust func(*Server)) (*httptest.Server, *fakeTS, *Server) {
 	t.Helper()
-	st, err := jit.Open(filepath.Join(t.TempDir(), "jit.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	st := jit.OpenMemory()
 	ts := &fakeTS{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := &jit.Service{Store: st, TS: ts, Log: log, Admins: []jit.Principal{"root@example.com"}}
@@ -424,31 +421,5 @@ func TestUnknownHostRefused(t *testing.T) {
 		if resp.StatusCode != tc.want {
 			t.Errorf("Host %q: status %d, want %d", tc.host, resp.StatusCode, tc.want)
 		}
-	}
-}
-
-func TestPluginURL(t *testing.T) {
-	for base, want := range map[string]string{
-		"http://jit.example.ts.net/":    "",
-		"http://jit":                    "",
-		"http://jit-1.example.ts.net":   "http://jit-1",
-		"http://access.example.ts.net/": "http://access",
-		"https://jit.example.ts.net":    "https://jit.example.ts.net",
-		"http://100.64.0.1":             "http://100.64.0.1",
-	} {
-		if got := (&Server{BaseURL: base}).pluginURL(); got != want {
-			t.Errorf("pluginURL(%q) = %q, want %q", base, got, want)
-		}
-	}
-}
-
-func TestHelpTellsPluginURL(t *testing.T) {
-	srv, _ := newTestServer(t)
-	if _, body := getPage(t, srv, "alice", "/help"); strings.Contains(body, "/plugin configure") {
-		t.Error("help mentions configuring the plugin although jitd is at http://jit")
-	}
-	srv, _, _ = newTestServerWith(t, func(s *Server) { s.BaseURL = "http://jit-1.example.ts.net" })
-	if _, body := getPage(t, srv, "alice", "/help"); !strings.Contains(body, "<code>http://jit-1</code>") {
-		t.Error("help does not tell people to set the plugin's jitd URL to http://jit-1")
 	}
 }

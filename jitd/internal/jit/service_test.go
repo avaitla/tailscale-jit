@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -100,10 +99,7 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	st, err := Open(filepath.Join(t.TempDir(), "jit.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	st := openTestStore(t)
 	h := &harness{ts: newFakeTS(), now: t0}
 	h.ts.groups = map[string][]string{"group:sre": {"Carol@example.com"}}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))

@@ -88,7 +88,7 @@ func main() {
 	envFile := flag.String("env-file", "", "credentials file for the Setup page; a temp file with made-up values if empty, so point it at a missing file to see the failure state")
 	demo := flag.Bool("demo", false, "use the demo cast (Maya, Sam, Priya, Leo), demo flows and two weeks of history, for screenshots")
 	baseURL := flag.String("base-url", "", "base URL used in approval links (default http://<listen>)")
-	defaultWho := flag.String("default", "", "person to assume when a request has no who cookie (e.g. so pamagent can talk to the preview)")
+	defaultWho := flag.String("default", "", "person to assume when a request has no who cookie (e.g. so an MCP client can talk to the preview)")
 	flag.Parse()
 	admins := []jit.Principal{"root@example.com"}
 	if *demo {
@@ -96,17 +96,7 @@ func main() {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	dir, err := os.MkdirTemp("", "jitd-preview-")
-	if err != nil {
-		log.Error("tempdir", "err", err)
-		os.Exit(1)
-	}
-	defer os.RemoveAll(dir)
-	st, err := jit.Open(filepath.Join(dir, "jit.db"))
-	if err != nil {
-		log.Error("store", "err", err)
-		os.Exit(1)
-	}
+	st := jit.OpenMemory()
 	ts := &fakeTS{attrs: map[string]time.Time{}}
 	svc := &jit.Service{Store: st, TS: ts, Log: log, Admins: admins}
 	svc.PolicyCache = &jit.PolicyCache{TS: ts, TTL: time.Minute, Log: log}
@@ -118,6 +108,12 @@ func main() {
 	}
 
 	if *envFile == "" {
+		dir, err := os.MkdirTemp("", "jitd-preview-")
+		if err != nil {
+			log.Error("tempdir", "err", err)
+			os.Exit(1)
+		}
+		defer os.RemoveAll(dir)
 		*envFile = filepath.Join(dir, "env")
 		os.WriteFile(*envFile, []byte("TS_OAUTH_CLIENT_ID=preview\nTS_OAUTH_CLIENT_SECRET=preview\n"), 0o600)
 	}
