@@ -47,10 +47,11 @@ step:
 
 1. Add a `group:jit-admins` group and let people reach `tag:jit` in the policy.
 2. Create an auth key and an OAuth client.
-3. Build and start jitd.
-4. Check that it works at http://jit/admin/setup.
-5. Create an approval flow.
-6. Paste the policy snippet jitd gives you.
+3. Create a Postgres database for it.
+4. Build and start jitd.
+5. Check that it works at http://jit/admin/setup.
+6. Create an approval flow.
+7. Paste the policy snippet jitd gives you.
 
 ### 2. Connect Claude Code (everyone using Claude Code)
 

@@ -5,7 +5,4 @@
 
 # jitd runtime state: never commit
 tsnet-state/
-*.db
-*.db-wal
-*.db-shm
 *.log

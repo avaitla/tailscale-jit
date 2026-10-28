@@ -52,10 +52,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *fakeTS) {
 // newTestServerWith lets a test adjust the Server before it is served.
 func newTestServerWith(t *testing.T, adjust func(*Server)) (*httptest.Server, *fakeTS, *Server) {
 	t.Helper()
-	st, err := jit.Open(filepath.Join(t.TempDir(), "jit.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	st := jit.OpenMemory()
 	ts := &fakeTS{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := &jit.Service{Store: st, TS: ts, Log: log, Admins: []jit.Principal{"root@example.com"}}

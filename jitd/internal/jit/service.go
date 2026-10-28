@@ -424,8 +424,8 @@ func cleanNote(note string) (string, error) {
 
 // cleanText trims free text from a member (a reason or a note), caps its
 // length and refuses control characters other than newlines and tabs. Admins
-// read this text in terminals too (the sqlite3 command line prints it raw), so
-// an escape sequence in it could rewrite what they see.
+// read this text in terminals too (psql prints it raw), so an escape sequence
+// in it could rewrite what they see.
 func cleanText(field, text string) (string, error) {
 	text = strings.TrimSpace(strings.ReplaceAll(text, "\r\n", "\n"))
 	if utf8.RuneCountInString(text) > MaxNoteLen {

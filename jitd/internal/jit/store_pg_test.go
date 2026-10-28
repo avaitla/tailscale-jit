@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -21,7 +20,7 @@ import (
 //
 // Each test gets a schema of its own, dropped afterwards. With
 // JITD_TEST_STORE=postgres as well, every service test runs on Postgres
-// instead of SQLite.
+// instead of in memory.
 
 // pgTestURL returns a URL for a new, empty schema, or skips the test.
 func pgTestURL(t *testing.T) string {
@@ -50,15 +49,19 @@ func pgTestURL(t *testing.T) string {
 	return u.String()
 }
 
-// openTestStore opens an empty store for a test: SQLite, or Postgres when
-// JITD_TEST_STORE=postgres.
+// openTestStore opens an empty store for a test: in memory, or Postgres
+// when JITD_TEST_STORE=postgres.
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "jit.db")
-	if os.Getenv("JITD_TEST_STORE") == "postgres" {
-		path = pgTestURL(t)
+	if os.Getenv("JITD_TEST_STORE") != "postgres" {
+		return OpenMemory()
 	}
-	s, err := Open(path)
+	return openStore(t, pgTestURL(t))
+}
+
+func openStore(t *testing.T, dsn string) *Store {
+	t.Helper()
+	s, err := Open(dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,11 +69,20 @@ func openTestStore(t *testing.T) *Store {
 	return s
 }
 
+func queryString(t *testing.T, s *Store, q string) string {
+	t.Helper()
+	var v string
+	if err := s.db.QueryRow(q).Scan(&v); err != nil {
+		t.Fatalf("%s: %v", q, err)
+	}
+	return v
+}
+
 func TestPostgresStore(t *testing.T) {
 	dsn := pgTestURL(t)
 	s := openStore(t, dsn)
-	if !s.pg || strings.Contains(s.Path, "password") {
-		t.Fatalf("pg %v, Path %q", s.pg, s.Path)
+	if strings.Contains(s.Path, "password") {
+		t.Fatalf("Path %q", s.Path)
 	}
 	mustUpdate(t, s, func(d *Data) error {
 		d.Workflows["wf_1"] = &Workflow{ID: "wf_1", Name: "one", MaxDuration: DefaultMaxDuration}
@@ -134,6 +146,9 @@ func TestPostgresStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := ro.Update(func(d *Data) error { d.Workflows["wf_1"].Name = "x"; return nil }); err == nil {
+		t.Error("wrote through a read-only store")
+	}
 	ro.Close()
 
 	if _, err := s2.db.Exec(`UPDATE jitd_meta SET schema_version = 99`); err != nil {
@@ -141,6 +156,32 @@ func TestPostgresStore(t *testing.T) {
 	}
 	if _, err := Open(dsn); err == nil || !strings.Contains(err.Error(), "newer jitd") {
 		t.Errorf("a newer schema: %v", err)
+	}
+
+	// The write itself fails: the working copy goes back, and nothing counts.
+	before := s2.changes // Changes would ask the closed database
+	s2.db.Close()
+	if err := s2.Update(func(d *Data) error { d.Workflows["wf_1"].Name = "changed"; return nil }); err == nil {
+		t.Fatal("expected an error from a closed database")
+	}
+	s2.View(func(d *Data) {
+		if d.Workflows["wf_1"].Name != "one" {
+			t.Error("a failed write was kept in the working copy")
+		}
+	})
+	if s2.changes != before {
+		t.Error("a failed write counted as a change")
+	}
+}
+
+func TestOpenRefusesOtherURLs(t *testing.T) {
+	for _, dsn := range []string{"jit.db", "mysql://x@y/z", ""} {
+		if _, err := Open(dsn); err == nil || !strings.Contains(err.Error(), "postgres://") {
+			t.Errorf("Open(%q): %v", dsn, err)
+		}
+	}
+	if got := RedactURL("postgres://jitd:secret@db:5432/jitd"); strings.Contains(got, "secret") {
+		t.Errorf("RedactURL = %q", got)
 	}
 }
 

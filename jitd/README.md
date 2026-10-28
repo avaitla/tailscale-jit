@@ -26,7 +26,7 @@ requester (or Claude Code) ──request──▶ jitd ◀──approve── ap
 When the attribute expires, Tailscale removes it and the grant stops
 applying. jitd doesn't have to be up for access to end.
 
-It's a proof of concept: one process, one SQLite (or Postgres) database, no
+It's a proof of concept: one process with one Postgres database, and no
 high availability.
 
 ## Before you start
@@ -43,6 +43,9 @@ You need:
 - A Linux or macOS host that stays up, with **Go 1.26.6** or newer. It doesn't
   need Tailscale installed, because jitd brings its own node. It does need
   outbound internet access to reach Tailscale.
+- A **Postgres** database (version 13 or newer) that host can reach, for
+  example a managed one. jitd keeps the approval flows and every request
+  there.
 
 ## Install
 
@@ -93,7 +96,26 @@ give it two scopes:
 
 Copy the client ID and the secret. The secret is shown only once.
 
-### 3. Build it
+### 3. Create the database
+
+Make a database and a user for jitd. jitd creates its own tables on the
+first start. In `psql`, as a Postgres admin:
+
+```sql
+CREATE USER jitd WITH PASSWORD '...';
+CREATE DATABASE jitd OWNER jitd;
+```
+
+jitd reads the database URL from `JITD_DATABASE_URL`, in the same env file as
+the OAuth client (next step), for example
+`postgres://jitd:...@db.internal:5432/jitd?sslmode=verify-full`. Use
+`sslmode=verify-full` (or at least `require`) whenever the database is on
+another machine: the rows hold every login, device and reason. Only a
+database on the same host can do with `sslmode=disable`. If the database has
+tables called `workflows` or `requests` already, give jitd a schema of its
+own: create it, and add `&search_path=jitd` to the URL.
+
+### 4. Build it
 
 ```sh
 git clone https://github.com/atoonk/tailscale-jit
@@ -104,16 +126,17 @@ go build -o bin/jitd ./jitd
 Or run `go install github.com/atoonk/tailscale-jit/jitd@latest`, which puts
 `jitd` in `~/go/bin`.
 
-### 4. Run it
+### 5. Run it
 
-The quickest way to try it is from your own shell. Put the OAuth client in
-a file that only you can read:
+The quickest way to try it is from your own shell. Put the OAuth client and
+the database in a file that only you can read:
 
 ```sh
 mkdir -p ~/.config/jitd
 cat > ~/.config/jitd/env <<'EOF'
 TS_OAUTH_CLIENT_ID=...
 TS_OAUTH_CLIENT_SECRET=tskey-client-...
+JITD_DATABASE_URL=postgres://jitd:...@db.internal:5432/jitd?sslmode=verify-full
 EOF
 chmod 600 ~/.config/jitd/env
 ```
@@ -141,8 +164,8 @@ Things to know:
   credential only a login can still get in to fix it. With no admins, nobody
   can create flows.
 - **Keep two things:** the node's identity in `./tsnet-state` (`-state-dir`)
-  and the flows and requests in the SQLite database `./jit.db` (`-data`).
-  Lose the state directory and jitd joins the tailnet as a new machine.
+  and the Postgres database with the flows and requests. Lose the state
+  directory and jitd joins the tailnet as a new machine.
 - **The name is taken?** If a machine called `jit` already exists, the new
   node becomes `jit-1`. Remove the old machine in the admin console and
   rename the node to `jit`, or keep the other name (or pick one with
@@ -194,10 +217,10 @@ sudo rm /etc/jitd/authkey
 ```
 
 If you already started jitd by hand, skip the key: move its `tsnet-state`
-directory and its database (`jit.db`) into
-`/var/lib/jitd` instead, owned by `jitd`.
+directory into `/var/lib/jitd` instead, owned by `jitd`. The database stays
+where it is.
 
-### 5. Check the setup
+### 6. Check the setup
 
 As an admin, open **http://jit/admin/setup**. It tests the credential the
 same way an approval will use it:
@@ -210,7 +233,7 @@ same way an approval will use it:
 If something fails, the page says what to fix and where. It never shows the
 credential. Fix the file, then click **Check again**. No restart needed.
 
-### 6. Create an approval flow
+### 7. Create an approval flow
 
 Go to **Manage → Approval flows → New flow**. A flow is one kind of access
 people can ask for. For example:
@@ -232,7 +255,7 @@ The fields:
   the **default and maximum duration**, and how long a request may wait for
   a decision.
 
-### 7. Add the flow to the policy
+### 8. Add the flow to the policy
 
 jitd never edits your policy; you paste in what it suggests. Open
 **Manage → Policy snippet** (or run `bin/jitd -policy-snippet`). For each
@@ -285,7 +308,7 @@ is defined, shows which grants use it, and says whether they match
 "Gives access to". If no grant uses the flow, the page says so, because
 approving it would unlock nothing.
 
-### 8. Try it
+### 9. Try it
 
 1. On your laptop, open http://jit/.
 2. Pick the flow and ask for 15 minutes.
@@ -315,63 +338,37 @@ Pages update on their own when something changes.
 
 ### Backups and digging into the history
 
-Everything jitd remembers is in its SQLite database, `jit.db`: the flows,
-and every request with its full timeline. Each row keeps the whole object as
-JSON in `data`, so the `sqlite3` command line (the `sqlite3` package) can
-answer questions the UI doesn't.
-
-Run it as the user jitd runs as, since only that user can read the
-database. With the systemd setup above:
+Everything jitd remembers is in its database: the flows, and every request
+with its full timeline. Each row keeps the whole object as `jsonb` in `data`,
+so `psql` can answer questions the UI doesn't:
 
 ```sh
-cd /var/lib/jitd
-
 # A consistent copy, safe while jitd runs. umask keeps it private:
 # it holds every login, device and reason.
-sudo -u jitd sh -c 'umask 077; sqlite3 -readonly jit.db ".backup jit-backup.db"'
+umask 077; pg_dump "$JITD_DATABASE_URL" > jitd-backup.sql
 
 # Who asked for what
-sudo -u jitd sqlite3 -readonly jit.db \
+psql "$JITD_DATABASE_URL" -c \
   "SELECT requester, status, count(*) FROM requests GROUP BY 1, 2"
 
 # The last ten reasons for one flow
-sudo -u jitd sqlite3 -readonly jit.db \
-  "SELECT id, json_extract(data, '$.reason') FROM requests
+psql "$JITD_DATABASE_URL" -c \
+  "SELECT id, data->>'reason' FROM requests
    WHERE workflow_id = 'wf_...' ORDER BY created_at DESC LIMIT 10"
+
+# Every event on one person's requests
+psql "$JITD_DATABASE_URL" -c \
+  "SELECT id, e->>'type', e->>'actor', e->>'at'
+   FROM requests, jsonb_array_elements(data->'timeline') e
+   WHERE requester = 'alice@example.com' ORDER BY e->>'at'"
 ```
-
-Two things to know:
-
-- **Look, don't touch.** jitd reads the database when it starts and keeps
-  it in memory, so it won't see a change you make while it runs, and may
-  overwrite it. Use `-readonly`, and only edit with jitd stopped.
-- **Copying the file?** Use `.backup` as above. If you copy files by hand,
-  stop jitd first and copy `jit.db-wal` along with `jit.db` if it's there:
-  after a crash, the latest changes are still in it.
-
-### Postgres instead of SQLite
-
-jitd can keep its data in Postgres instead, for example a managed database,
-so the flows and the history outlive the machine jitd runs on. Give `-data`
-a URL, or set `JITD_DATABASE_URL` (or `DATABASE_URL`, which platforms often
-set for an attached database) and leave `-data` out:
-
-```sh
-JITD_DATABASE_URL='postgres://jitd:...@db.internal:5432/jitd?sslmode=require' \
-  bin/jitd -admins group:jit-admins,you@example.com
-```
-
-jitd creates its tables on the first start: `workflows` and `requests`,
-with each object as `jsonb` in `data`, and `jitd_meta`. If the database has
-tables of those names already, give jitd a schema of its own with
-`&search_path=jitd` in the URL (create the schema first). The log shows the
-URL with the password hidden, and `-help` never prints it.
 
 Things to know:
 
-- **Keep `tsnet-state` too.** The database holds the flows and requests;
-  jitd's identity on the tailnet is still in `-state-dir`. Lose it and jitd
-  joins as a new machine.
+- **Look, don't touch.** jitd keeps a copy in memory. It notices a change
+  only through `jitd_meta.generation`, so if you edit rows by hand, stop
+  jitd first, or bump `jitd_meta.generation` in the same transaction, so
+  jitd rereads them instead of writing over them.
 - **Several jitds on one database** keep the data consistent: each one
   rereads when another has changed something, writes take turns, and each
   state change (an approval, a submit) holds a database lock, so two jitds
@@ -379,10 +376,7 @@ Things to know:
   But every jitd is its own machine on the tailnet (`jit`, `jit-1`, ...),
   and this version puts no single name in front of them. Use it to run a
   standby that takes over, not two that share the traffic.
-- **Editing rows by hand:** stop jitd first, or bump
-  `jitd_meta.generation` in the same transaction, so jitd rereads them
-  instead of writing over them.
-- **Backups:** `pg_dump`, or your provider's snapshots.
+- **Backups:** `pg_dump` as above, or your provider's snapshots.
 
 ---
 
@@ -433,8 +427,8 @@ expired attribute about a minute after the expiry time (we measured about
 |---|---|---|
 | `-admins` | none | who may manage flows and see every request: logins, `group:`, `tag:` (not `autogroup:admin`; use a group such as `group:jit-admins`) |
 | `-state-dir` | `tsnet-state` | the node's identity; keep it |
-| `-data` | `jit.db` | the database with the approval flows and access requests: a SQLite file, or a `postgres://` URL (see [Postgres](#postgres-instead-of-sqlite)). Without it, `JITD_DATABASE_URL` is used if set, or `DATABASE_URL` if it is a `postgres://` URL. Name an older jitd's `.json` file and jitd uses the `.db` of the same name, filled from the `.json` the first time |
-| `-env-file` | `~/.config/jitd/env` (Linux), `~/Library/Application Support/jitd/env` (macOS) | Tailscale API credentials: `TS_OAUTH_CLIENT_ID` and `TS_OAUTH_CLIENT_SECRET`, or `TS_API_KEY` |
+| `-database` | `JITD_DATABASE_URL` | the Postgres database with the approval flows and access requests, as a `postgres://` URL. Without the flag, jitd uses `JITD_DATABASE_URL` from the env file, or from the environment. The log and `-help` never show its password |
+| `-env-file` | `~/.config/jitd/env` (Linux), `~/Library/Application Support/jitd/env` (macOS) | `JITD_DATABASE_URL`, and the Tailscale API credentials: `TS_OAUTH_CLIENT_ID` and `TS_OAUTH_CLIENT_SECRET`, or `TS_API_KEY` |
 | `-hostname` | `jit` | the machine name on the tailnet |
 | `-tag` | `tag:jit` | the tag jitd runs as, used in the policy snippet |
 | `-https` | off | serve :443 with a Tailscale certificate and redirect :80; needs HTTPS turned on for the tailnet (admin console → DNS) |
@@ -495,12 +489,12 @@ instructions say so.
 ## Development
 
 ```sh
-go test ./...            # from the repository root
-go run ./jitd/preview    # the UI with made-up people; no tailnet needed
+go test ./...            # from the repository root; no database needed
+go run ./jitd/preview    # the UI with made-up people; no tailnet or database needed
 ```
 
 The preview serves the UI at http://127.0.0.1:8099/as/bob, with a fake
-Tailscale API and some flows. Swap `bob` for alice, carol, dave, or root
+Tailscale API, an in-memory store and some flows. Swap `bob` for alice, carol, dave, or root
 (the admin) to see it as someone else. `-demo` switches to the cast from the
 screenshots: Maya, Sam, Priya, and Leo as the admin, with two weeks of
 history.
@@ -515,9 +509,10 @@ claude mcp add --transport http jitd-preview http://127.0.0.1:8099/mcp
 Claude's requests then count as Maya's, and you approve them in the browser
 at http://127.0.0.1:8099/as/sam.
 
-The Postgres tests run when `JITD_TEST_POSTGRES_URL` names a database they
-may create schemas in (each test makes its own and drops it). Add
-`JITD_TEST_STORE=postgres` to run every service test on Postgres too:
+Unit tests keep their data in memory. The Postgres tests run when
+`JITD_TEST_POSTGRES_URL` names a database they may create schemas in (each
+test makes its own and drops it). Add `JITD_TEST_STORE=postgres` to run
+every service test on Postgres too:
 
 ```sh
 JITD_TEST_POSTGRES_URL='postgres://jitd@127.0.0.1:5432/jitdtest?sslmode=disable' \
@@ -528,7 +523,7 @@ Code layout:
 
 ```
 jitd/main.go             flags, the tsnet node, startup
-jitd/internal/jit        the model and the rules: flows, requests, approvals, policy check and snippet, SQLite store
+jitd/internal/jit        the model and the rules: flows, requests, approvals, policy check and snippet, Postgres store
 jitd/internal/jithttp    HTTP API, web UI (templates/, static/), OpenAPI spec
 jitd/internal/tsapi      Tailscale API client: posture attributes, policy file
 jitd/internal/setup      the credential check behind /admin/setup

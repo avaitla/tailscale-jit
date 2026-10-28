@@ -34,9 +34,9 @@ import (
 func main() {
 	hostname := flag.String("hostname", "jit", "tailnet hostname for this node")
 	stateDir := flag.String("state-dir", "tsnet-state", "directory for the tsnet node state (keep it; otherwise the node re-registers)")
-	dataPath := flag.String("data", "jit.db", "database for approval flows and access requests: a SQLite file, or a postgres:// URL. Without -data, JITD_DATABASE_URL is used if set, or DATABASE_URL if it is a postgres:// URL.")
+	database := flag.String("database", "", "Postgres database for approval flows and access requests, as a postgres:// URL; without it, JITD_DATABASE_URL from -env-file or the environment")
 	apiBase := flag.String("ts-api", tsapi.DefaultBaseURL, "Tailscale API base URL")
-	envFile := flag.String("env-file", defaultEnvFile(), "file with the Tailscale API credentials (TS_OAUTH_CLIENT_ID and TS_OAUTH_CLIENT_SECRET, or TS_API_KEY), one KEY=VALUE per line; the environment is used for anything the file lacks")
+	envFile := flag.String("env-file", defaultEnvFile(), "file with the Tailscale API credentials (TS_OAUTH_CLIENT_ID and TS_OAUTH_CLIENT_SECRET, or TS_API_KEY) and JITD_DATABASE_URL, one KEY=VALUE per line; the environment is used for anything the file lacks")
 	jitTag := flag.String("tag", "tag:jit", "tag this node runs as (used in the policy snippet)")
 	expiryInterval := flag.Duration("expiry-interval", 30*time.Second, "how often to mark approved requests past their expiry as expired")
 	policySnippet := flag.Bool("policy-snippet", false, "print the policy-file snippet for the current approval flows and exit")
@@ -49,11 +49,6 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	dataSet := false
-	flag.Visit(func(f *flag.Flag) { dataSet = dataSet || f.Name == "data" })
-	if !dataSet {
-		*dataPath = cmp.Or(dataFromEnv(), *dataPath)
-	}
 
 	level := slog.LevelInfo
 	if *verbose {
@@ -61,8 +56,14 @@ func main() {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
+	dsn, err := databaseURL(*database, *envFile)
+	if err != nil {
+		log.Error("no database", "err", err)
+		os.Exit(1)
+	}
+
 	if *policySnippet {
-		store, err := jit.OpenReadOnly(*dataPath)
+		store, err := jit.OpenReadOnly(dsn)
 		if err != nil {
 			log.Error("cannot read the database", "err", err)
 			os.Exit(1)
@@ -72,19 +73,14 @@ func main() {
 		return
 	}
 
-	store, err := jit.Open(*dataPath)
+	store, err := jit.Open(dsn)
 	if err != nil {
 		log.Error("cannot use the database", "err", err)
 		os.Exit(1)
 	}
 	defer store.Close()
 	store.Log = log
-	if jit.IsPostgres(*dataPath) {
-		log.Info("using Postgres", "database", store.Path)
-	}
-	if store.Mode&0o077 != 0 {
-		log.Warn("other users can read the database; run: chmod 600 "+store.Path, "mode", store.Mode)
-	}
+	log.Info("using the database", "database", store.Path)
 	svc := &jit.Service{Store: store, Log: log, UIPorts: []string{"tcp:80"}}
 	if *https {
 		svc.UIPorts = []string{"tcp:80", "tcp:443"} // :80 redirects to :443
@@ -256,18 +252,26 @@ func main() {
 	}
 }
 
-// dataFromEnv is the database to use without -data: JITD_DATABASE_URL, else
-// DATABASE_URL if it names Postgres (platforms set it for whatever database
-// they attach). It is not the flag's default, so -help never prints a
-// password.
-func dataFromEnv() string {
-	if u := os.Getenv("JITD_DATABASE_URL"); u != "" {
-		return u
+// databaseURL is the database to use: -database, else JITD_DATABASE_URL from
+// the env file, else from the environment. The variable is not the flag's
+// default, so -help never prints a password.
+func databaseURL(flagValue, envFile string) (string, error) {
+	u := flagValue
+	if u == "" && envFile != "" {
+		vars, err := setup.ReadEnvFile(envFile)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		u = vars["JITD_DATABASE_URL"]
 	}
-	if u := os.Getenv("DATABASE_URL"); jit.IsPostgres(u) {
-		return u
+	u = cmp.Or(u, os.Getenv("JITD_DATABASE_URL"))
+	if u == "" {
+		return "", fmt.Errorf("set JITD_DATABASE_URL=postgres://user:password@host:5432/jitd in %s or the environment, or pass -database", envFile)
 	}
-	return ""
+	if !jit.IsPostgres(u) {
+		return "", fmt.Errorf("the database must be a postgres:// URL, not %s", jit.RedactURL(u))
+	}
+	return u, nil
 }
 
 // defaultEnvFile is <user config dir>/jitd/env, e.g. ~/.config/jitd/env.
