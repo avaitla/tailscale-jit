@@ -44,7 +44,9 @@ func TestWhoIsResolver(t *testing.T) {
 		"100.64.0.9:4444": `{"Node":{"StableID":"nCI","Name":"ci.example.ts.net.","Tags":["tag:agent"]},
 			"UserProfile":{"LoginName":"tagged-devices","DisplayName":"Tagged Devices"}}`,
 	})
-	res := &WhoIsResolver{Client: &local.Client{Socket: sock}}
+	// UseSocketOnly: on a Mac running the Tailscale app, the client would
+	// otherwise talk to the app instead of the fake.
+	res := &WhoIsResolver{Client: &local.Client{Socket: sock, UseSocketOnly: true}}
 	resolve := func(addr string) (Identity, error) {
 		r := httptest.NewRequest("GET", "/v1/me", nil)
 		r.RemoteAddr = addr

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -19,16 +20,9 @@ import (
 
 // Data is everything jitd persists.
 type Data struct {
-	// Version is the format of the JSON data file older jitd versions kept
-	// (see Open). The database has its own version (schemaVersion).
-	Version   int                       `json:"version"`
 	Workflows map[string]*Workflow      `json:"workflows"`
 	Requests  map[string]*AccessRequest `json:"requests"`
 }
-
-// LegacyDataFile is the data file of jitd versions before SQLite. A new
-// database called jit.db is filled from it when it sits next to it.
-const LegacyDataFile = "jit-data.json"
 
 // schemaVersion is kept in PRAGMA user_version. To change the tables, add a
 // step to migrate and bump it; never edit schemaV1 or an existing step.
@@ -64,28 +58,33 @@ func timeColumn(t time.Time) string {
 // comparing every row with the database. Update then returns nil.
 var errNoChange = errors.New("no change")
 
-// Store keeps approval flows and access requests in a SQLite database, with a
-// working copy in memory. Each row holds the object as JSON, plus a few
-// columns for ad-hoc queries. An Update writes only the rows that changed,
-// in one transaction.
+// Store keeps approval flows and access requests in a SQLite or Postgres
+// database, with a working copy in memory. Each row holds the object as JSON,
+// plus a few columns for ad-hoc queries. An Update writes only the rows that
+// changed, in one transaction.
 //
-// jitd must be the only writer: it does not see changes made to the database
-// by anything else while it runs.
+// With SQLite, jitd must be the only writer: it does not see changes made to
+// the database by anything else while it runs. With Postgres, every read
+// first checks whether another jitd changed the database and reloads if so,
+// and every write locks the database first (see store_postgres.go).
 type Store struct {
 	db      *sql.DB
+	pg      bool // Postgres; else SQLite
 	mu      sync.Mutex
 	d       Data
 	saved   map[rowKey][]byte // each row's JSON as it is in the database
 	changes uint64
-	broken  error // set if the working copy could not be put back after a failed update
+	gen     int64         // Postgres: the generation the working copy was loaded at
+	notify  chan struct{} // closed at the next counted change; see Changed
+	broken  error         // set if the working copy could not be put back after a failed update
 
-	// Path is the database file. Imported is the JSON file it was just
-	// filled from, or "". Ignored is a JSON file named in place of the
-	// database that was not read because the database already existed.
-	Path, Imported, Ignored string
+	// Path is the database file, or the Postgres URL without its password.
+	Path string
 	// Mode is the database file's permissions when it already existed (jitd
 	// creates it 0600), so jitd can warn if others can read it.
 	Mode fs.FileMode
+	// Log reports a failed reload from Postgres; nil discards it.
+	Log *slog.Logger
 }
 
 type rowKey struct {
@@ -93,101 +92,40 @@ type rowKey struct {
 	id    string
 }
 
-// Open opens the SQLite database at path, creating it if needed.
-//
-// It also upgrades from the JSON data file of older jitd versions:
-//   - If path ends in ".json", the database is the same name with ".db".
-//     When that does not exist yet, it is filled from the JSON file.
-//   - A new database called jit.db is filled from jit-data.json next to it,
-//     if there is one (the old default).
-//
-// The JSON file is left alone. The import is all or nothing: the database is
-// built under another name and renamed into place when it is complete.
+// Open opens the SQLite database at path, creating it if needed. A
+// postgres:// or postgresql:// URL opens that Postgres database instead.
 func Open(path string) (*Store, error) {
-	var from string
-	if filepath.Ext(path) == ".json" {
-		from = path
-		path = path[:len(path)-len(".json")] + ".db"
+	if IsPostgres(path) {
+		return openPostgres(path, false)
 	}
 	if fi, err := os.Stat(path); err == nil {
 		s, err := openDB(path, false)
 		if s != nil {
-			s.Ignored, s.Mode = from, fi.Mode().Perm()
+			s.Mode = fi.Mode().Perm()
 		}
 		return s, err
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
-
-	// A new database.
-	if from == "" && filepath.Base(path) == "jit.db" {
-		if old := filepath.Join(filepath.Dir(path), LegacyDataFile); exists(old) {
-			from = old
-		}
-	}
-	if from == "" {
-		if err := createPrivate(path); err != nil {
-			return nil, err
-		}
-		s, err := openDB(path, false)
-		if err != nil {
-			removeDB(path)
-		}
-		return s, err
-	}
-	if _, err := os.Stat(from); err != nil {
-		return nil, fmt.Errorf("nothing to import: %w (name a .db file to start with an empty database)", err)
-	}
-	tmp := path + ".importing"
-	removeDB(tmp) // left over from an import that was interrupted
-	if err := buildFrom(tmp, from); err != nil {
-		removeDB(tmp)
+	if err := createPrivate(path); err != nil {
 		return nil, err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		removeDB(tmp)
-		return nil, err
-	}
-	syncDir(filepath.Dir(path))
 	s, err := openDB(path, false)
 	if err != nil {
-		return nil, err
+		removeDB(path)
 	}
-	s.Imported = from
-	return s, nil
+	return s, err
 }
 
 // OpenReadOnly opens an existing database without changing it.
 func OpenReadOnly(path string) (*Store, error) {
-	if filepath.Ext(path) == ".json" {
-		path = path[:len(path)-len(".json")] + ".db"
+	if IsPostgres(path) {
+		return openPostgres(path, true)
 	}
 	if _, err := os.Stat(path); err != nil {
 		return nil, err
 	}
 	return openDB(path, true)
-}
-
-// buildFrom creates the database tmp from the JSON data file from.
-func buildFrom(tmp, from string) error {
-	if err := createPrivate(tmp); err != nil {
-		return err
-	}
-	s, err := openDB(tmp, false)
-	if err != nil {
-		return err
-	}
-	if err := s.importJSON(from); err != nil {
-		s.Close()
-		return err
-	}
-	if err := s.Close(); err != nil { // checkpoints the WAL into tmp and removes it
-		return err
-	}
-	if exists(tmp + "-wal") {
-		return errors.New("importing: the database was not completely written")
-	}
-	return nil
 }
 
 func openDB(path string, readOnly bool) (*Store, error) {
@@ -315,28 +253,56 @@ func migrateV2(tx *sql.Tx) error {
 	return nil
 }
 
+// querier is a database or a transaction.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 // load reads every row into the working copy.
 func (s *Store) load() error {
-	s.saved = map[rowKey][]byte{}
-	rows, err := s.db.Query("SELECT 'workflows', id, data FROM workflows UNION ALL SELECT 'requests', id, data FROM requests")
+	return s.loadFrom(context.Background(), s.db)
+}
+
+// loadFrom reads every row through q into the working copy. If that fails,
+// the working copy stays as it was.
+func (s *Store) loadFrom(ctx context.Context, q querier) error {
+	query := "SELECT 'workflows', id, data FROM workflows UNION ALL SELECT 'requests', id, data FROM requests"
+	if s.pg {
+		query = "SELECT 'workflows', id, data::text FROM workflows UNION ALL SELECT 'requests', id, data::text FROM requests"
+	}
+	rows, err := q.QueryContext(ctx, query)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
+	saved := map[rowKey][]byte{}
 	for rows.Next() {
 		var k rowKey
 		var b []byte
 		if err := rows.Scan(&k.table, &k.id, &b); err != nil {
 			return err
 		}
-		s.saved[k] = b
+		saved[k] = b
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	old := s.saved
+	s.saved = saved
 	d, err := s.decode()
 	if err != nil {
+		s.saved = old
 		return err
+	}
+	if s.pg {
+		// jsonb stores JSON its own way (key order, spacing): keep each row
+		// as jitd writes it, so diff only finds real changes.
+		if err := s.normalize(d); err != nil {
+			s.saved = old
+			return err
+		}
 	}
 	s.d = d
 	return nil
@@ -344,7 +310,7 @@ func (s *Store) load() error {
 
 // decode builds a working copy from the stored rows.
 func (s *Store) decode() (Data, error) {
-	d := Data{Version: 1, Workflows: map[string]*Workflow{}, Requests: map[string]*AccessRequest{}}
+	d := Data{Workflows: map[string]*Workflow{}, Requests: map[string]*AccessRequest{}}
 	for k, b := range s.saved {
 		var err error
 		if k.table == "workflows" {
@@ -370,46 +336,6 @@ func singular(table string) string {
 	return "request"
 }
 
-// importJSON fills a new, empty database from the data file of an older jitd.
-func (s *Store) importJSON(path string) error {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	var old Data
-	if err := json.Unmarshal(b, &old); err != nil {
-		return fmt.Errorf("importing %s: %w", path, err)
-	}
-	if old.Version > 1 {
-		return fmt.Errorf("importing %s: unknown version %d", path, old.Version)
-	}
-	for id, w := range old.Workflows {
-		if w == nil || w.ID == "" || w.ID != id {
-			return fmt.Errorf("importing %s: flow %q is empty or has another id", path, id)
-		}
-	}
-	for id, r := range old.Requests {
-		if r == nil || r.ID == "" || r.ID != id {
-			return fmt.Errorf("importing %s: request %q is empty or has another id", path, id)
-		}
-	}
-	err = s.Update(func(d *Data) error {
-		d.Workflows, d.Requests = old.Workflows, old.Requests
-		if d.Workflows == nil {
-			d.Workflows = map[string]*Workflow{}
-		}
-		if d.Requests == nil {
-			d.Requests = map[string]*AccessRequest{}
-		}
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("importing %s: %w", path, err)
-	}
-	s.changes = 0
-	return nil
-}
-
 // Close closes the database.
 func (s *Store) Close() error {
 	s.mu.Lock()
@@ -418,9 +344,16 @@ func (s *Store) Close() error {
 }
 
 // View runs fn with read access under the lock. fn must not keep references.
+// With Postgres it first picks up changes made by another jitd; if that
+// fails, fn sees the working copy as it was.
 func (s *Store) View(fn func(d *Data)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.pg {
+		if err := s.refresh(context.Background()); err != nil && s.Log != nil {
+			s.Log.Error("reading the database", "err", err)
+		}
+	}
 	fn(&s.d)
 }
 
@@ -460,6 +393,15 @@ func (s *Store) update(fn func(d *Data) error, count func() bool) (err error) {
 	if s.broken != nil {
 		return s.broken
 	}
+	// With Postgres the transaction starts first: it locks out other jitds
+	// and brings the working copy up to date before fn sees it.
+	var tx *sql.Tx
+	if s.pg {
+		if tx, err = s.beginPG(context.Background()); err != nil {
+			return err
+		}
+		defer tx.Rollback()
+	}
 	defer func() {
 		if p := recover(); p != nil {
 			s.rollback()
@@ -474,8 +416,13 @@ func (s *Store) update(fn func(d *Data) error, count func() bool) (err error) {
 	if err == nil {
 		changed, err = s.diff()
 	}
+	counted := len(changed) > 0 && count()
 	if err == nil && len(changed) > 0 {
-		err = s.write(changed)
+		if tx != nil {
+			err = s.commitPG(tx, changed, counted)
+		} else {
+			err = s.write(changed)
+		}
 	}
 	if err != nil {
 		return errors.Join(err, s.rollback())
@@ -487,10 +434,32 @@ func (s *Store) update(fn func(d *Data) error, count func() bool) (err error) {
 			s.saved[c.key] = c.data
 		}
 	}
-	if len(changed) > 0 && count() {
+	if counted {
 		s.changes++
+		s.signal()
 	}
 	return nil
+}
+
+// signal wakes everyone waiting in Changed. The caller holds s.mu.
+func (s *Store) signal() {
+	if s.notify != nil {
+		close(s.notify)
+		s.notify = nil
+	}
+}
+
+// Changed returns a channel that is closed at the next change this jitd
+// makes or (with Postgres) picks up from another jitd. Waiters should still
+// re-check now and then: a change another jitd made is only noticed when
+// something reads the store.
+func (s *Store) Changed() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.notify == nil {
+		s.notify = make(chan struct{})
+	}
+	return s.notify
 }
 
 // rollback puts the working copy back to what is in the database. If that
@@ -551,36 +520,55 @@ func (s *Store) write(changed []row) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err := s.writeRows(ctx, tx, changed); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// writeRows writes changed through q.
+func (s *Store) writeRows(ctx context.Context, q querier, changed []row) error {
 	for _, c := range changed {
 		var err error
 		switch {
 		case c.data == nil:
 			// The table name is one of two constants, never input.
-			_, err = tx.ExecContext(ctx, "DELETE FROM "+c.key.table+" WHERE id = ?", c.key.id)
+			_, err = q.ExecContext(ctx, s.sql("DELETE FROM "+c.key.table+" WHERE id = ?"), c.key.id)
 		case c.w != nil:
-			_, err = tx.ExecContext(ctx, `INSERT INTO workflows (id, name, data) VALUES (?, ?, ?)
-				ON CONFLICT (id) DO UPDATE SET name = excluded.name, data = excluded.data`,
+			_, err = q.ExecContext(ctx, s.sql(`INSERT INTO workflows (id, name, data) VALUES (?, ?, ?)
+				ON CONFLICT (id) DO UPDATE SET name = excluded.name, data = excluded.data`),
 				c.key.id, c.w.Name, string(c.data))
 		default:
-			_, err = tx.ExecContext(ctx, `INSERT INTO requests (id, workflow_id, requester, status, created_at, data)
+			var created any = timeColumn(c.r.CreatedAt)
+			if s.pg {
+				created = c.r.CreatedAt.UTC() // a timestamptz column
+			}
+			_, err = q.ExecContext(ctx, s.sql(`INSERT INTO requests (id, workflow_id, requester, status, created_at, data)
 				VALUES (?, ?, ?, ?, ?, ?)
 				ON CONFLICT (id) DO UPDATE SET workflow_id = excluded.workflow_id, requester = excluded.requester,
-					status = excluded.status, created_at = excluded.created_at, data = excluded.data`,
+					status = excluded.status, created_at = excluded.created_at, data = excluded.data`),
 				c.key.id, c.r.WorkflowID, c.r.Requester.Login, string(c.r.Status),
-				timeColumn(c.r.CreatedAt), string(c.data))
+				created, string(c.data))
 		}
 		if err != nil {
 			return fmt.Errorf("saving %s %s: %w", singular(c.key.table), c.key.id, err)
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
-// Changes counts successful updates since the store was opened. Pages poll it
-// to learn that something changed without reloading blindly.
+// Changes counts the changes pages should see. Pages poll it to learn that
+// something changed without reloading blindly. With SQLite it counts since
+// the store was opened; with Postgres it is shared by every jitd on the
+// database.
 func (s *Store) Changes() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.pg {
+		if n, err := s.changesPG(context.Background()); err == nil {
+			return n
+		}
+	}
 	return s.changes
 }
 
@@ -605,14 +593,6 @@ func removeDB(path string) {
 func exists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
-}
-
-// syncDir makes a rename in dir durable.
-func syncDir(dir string) {
-	if f, err := os.Open(dir); err == nil {
-		f.Sync()
-		f.Close()
-	}
 }
 
 // clone deep-copies v through JSON so callers never share store memory.

@@ -88,7 +88,7 @@ func main() {
 	envFile := flag.String("env-file", "", "credentials file for the Setup page; a temp file with made-up values if empty, so point it at a missing file to see the failure state")
 	demo := flag.Bool("demo", false, "use the demo cast (Maya, Sam, Priya, Leo), demo flows and two weeks of history, for screenshots")
 	baseURL := flag.String("base-url", "", "base URL used in approval links (default http://<listen>)")
-	defaultWho := flag.String("default", "", "person to assume when a request has no who cookie (e.g. so pamagent can talk to the preview)")
+	defaultWho := flag.String("default", "", "person to assume when a request has no who cookie (e.g. so an MCP client can talk to the preview)")
 	flag.Parse()
 	admins := []jit.Principal{"root@example.com"}
 	if *demo {

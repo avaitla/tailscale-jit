@@ -26,7 +26,8 @@ requester (or Claude Code) ──request──▶ jitd ◀──approve── ap
 When the attribute expires, Tailscale removes it and the grant stops
 applying. jitd doesn't have to be up for access to end.
 
-It's a proof of concept: one process, one SQLite database, no high availability.
+It's a proof of concept: one process, one SQLite (or Postgres) database, no
+high availability.
 
 ## Before you start
 
@@ -142,20 +143,12 @@ Things to know:
 - **Keep two things:** the node's identity in `./tsnet-state` (`-state-dir`)
   and the flows and requests in the SQLite database `./jit.db` (`-data`).
   Lose the state directory and jitd joins the tailnet as a new machine.
-- **Upgrading from a jitd that kept its data in `jit-data.json`?** With the
-  default `-data`, there's nothing to do: on its first start, jitd finds
-  `jit-data.json` next to the new `jit.db` and imports every flow and the
-  whole request history. If you passed `-data some/path.json`, leave the
-  flag as it is: jitd fills `some/path.db` from it once and uses that from
-  then on. Either way the JSON file is left as it was; keep it as a backup.
-  The log says `imported the old JSON data file`.
 - **The name is taken?** If a machine called `jit` already exists, the new
   node becomes `jit-1`. Remove the old machine in the admin console and
   rename the node to `jit`, or keep the other name (or pick one with
-  `-hostname`). The Claude Code plugin looks for `http://jit`, so with
-  another name everyone using it sets the plugin's **jitd URL** once, for
-  example to `http://jit-1`, with `/plugin configure tailscale-pam@tailscale-jit`. jitd's
-  Help page tells people the exact value.
+  `-hostname`). With another name, people connect Claude Code to that
+  name instead, for example `http://jit-1/mcp`. jitd's Help page tells
+  people the exact value.
 - **No auth key?** Then jitd logs a login URL instead. Open it and approve
   the machine, then tag it `tag:jit` in the admin console.
 
@@ -201,7 +194,7 @@ sudo rm /etc/jitd/authkey
 ```
 
 If you already started jitd by hand, skip the key: move its `tsnet-state`
-directory and its data (`jit.db`, or an older `jit-data.json`) into
+directory and its database (`jit.db`) into
 `/var/lib/jitd` instead, owned by `jitd`.
 
 ### 5. Check the setup
@@ -303,9 +296,8 @@ The request page should say **Active · confirmed on the device**, and the
 service shows up in `tailscale service list` within a few seconds. In 15
 minutes it disappears again.
 
-To try it with Claude Code, install the plugin (see the
-[main README](../README.md)) and ask Claude for something that needs the
-access.
+To try it with Claude Code, connect it to jitd (see [MCP](#mcp)) and ask
+Claude for something that needs the access.
 
 ## Day to day
 
@@ -357,6 +349,41 @@ Two things to know:
   stop jitd first and copy `jit.db-wal` along with `jit.db` if it's there:
   after a crash, the latest changes are still in it.
 
+### Postgres instead of SQLite
+
+jitd can keep its data in Postgres instead, for example a managed database,
+so the flows and the history outlive the machine jitd runs on. Give `-data`
+a URL, or set `JITD_DATABASE_URL` (or `DATABASE_URL`, which platforms often
+set for an attached database) and leave `-data` out:
+
+```sh
+JITD_DATABASE_URL='postgres://jitd:...@db.internal:5432/jitd?sslmode=require' \
+  bin/jitd -admins group:jit-admins,you@example.com
+```
+
+jitd creates its tables on the first start: `workflows` and `requests`,
+with each object as `jsonb` in `data`, and `jitd_meta`. If the database has
+tables of those names already, give jitd a schema of its own with
+`&search_path=jitd` in the URL (create the schema first). The log shows the
+URL with the password hidden, and `-help` never prints it.
+
+Things to know:
+
+- **Keep `tsnet-state` too.** The database holds the flows and requests;
+  jitd's identity on the tailnet is still in `-state-dir`. Lose it and jitd
+  joins as a new machine.
+- **Several jitds on one database** keep the data consistent: each one
+  rereads when another has changed something, writes take turns, and each
+  state change (an approval, a submit) holds a database lock, so two jitds
+  cannot approve one request twice or file two requests for one device.
+  But every jitd is its own machine on the tailnet (`jit`, `jit-1`, ...),
+  and this version puts no single name in front of them. Use it to run a
+  standby that takes over, not two that share the traffic.
+- **Editing rows by hand:** stop jitd first, or bump
+  `jitd_meta.generation` in the same transaction, so jitd rereads them
+  instead of writing over them.
+- **Backups:** `pg_dump`, or your provider's snapshots.
+
 ---
 
 # Reference
@@ -406,7 +433,7 @@ expired attribute about a minute after the expiry time (we measured about
 |---|---|---|
 | `-admins` | none | who may manage flows and see every request: logins, `group:`, `tag:` (not `autogroup:admin`; use a group such as `group:jit-admins`) |
 | `-state-dir` | `tsnet-state` | the node's identity; keep it |
-| `-data` | `jit.db` | the SQLite database with the approval flows and access requests. Name an older jitd's `.json` file and jitd uses the `.db` of the same name, filled from the `.json` the first time |
+| `-data` | `jit.db` | the database with the approval flows and access requests: a SQLite file, or a `postgres://` URL (see [Postgres](#postgres-instead-of-sqlite)). Without it, `JITD_DATABASE_URL` is used if set, or `DATABASE_URL` if it is a `postgres://` URL. Name an older jitd's `.json` file and jitd uses the `.db` of the same name, filled from the `.json` the first time |
 | `-env-file` | `~/.config/jitd/env` (Linux), `~/Library/Application Support/jitd/env` (macOS) | Tailscale API credentials: `TS_OAUTH_CLIENT_ID` and `TS_OAUTH_CLIENT_SECRET`, or `TS_API_KEY` |
 | `-hostname` | `jit` | the machine name on the tailnet |
 | `-tag` | `tag:jit` | the tag jitd runs as, used in the policy snippet |
@@ -446,6 +473,25 @@ Errors look like `{"error": {"code": "...", "message": "..."}}`. Some carry
 `request_id` and `url`, for example when you ask twice and jitd points you
 at the request you already have.
 
+## MCP
+
+jitd also serves its request flow as an MCP server at `/mcp` (streamable
+HTTP), so Claude Code can ask for access with nothing to install:
+
+```sh
+claude mcp add --transport http --scope user jitd http://jit/mcp
+```
+
+Like the API, it knows who is calling from the Tailscale connection, so it
+needs no token, and access goes to the device Claude runs on. Its tools
+are `list_requestable`, `request_access`, `get_access_request`,
+`cancel_access_request` and `wait_for_decision`, which returns as soon as
+the request is decided, or after 30 seconds; the instructions tell Claude
+to call it again while the request is pending, for up to 10 minutes. There
+is no tool to approve. jitd can't see which services the caller's machine
+reaches, so Claude runs `tailscale service list` for that, and the
+instructions say so.
+
 ## Development
 
 ```sh
@@ -463,13 +509,20 @@ To try the MCP tools against the preview, without a jitd on your tailnet:
 
 ```sh
 go run ./jitd/preview -demo -default maya &
-go build -o bin/pamagent ./pamagent
-claude mcp add --transport stdio pamagent-preview -- "$PWD/bin/pamagent" -jit-url http://127.0.0.1:8099
+claude mcp add --transport http jitd-preview http://127.0.0.1:8099/mcp
 ```
 
 Claude's requests then count as Maya's, and you approve them in the browser
-at http://127.0.0.1:8099/as/sam. `list_services` still asks the local
-tailscaled, so it shows your real tailnet (or an error without one).
+at http://127.0.0.1:8099/as/sam.
+
+The Postgres tests run when `JITD_TEST_POSTGRES_URL` names a database they
+may create schemas in (each test makes its own and drops it). Add
+`JITD_TEST_STORE=postgres` to run every service test on Postgres too:
+
+```sh
+JITD_TEST_POSTGRES_URL='postgres://jitd@127.0.0.1:5432/jitdtest?sslmode=disable' \
+  JITD_TEST_STORE=postgres go test ./jitd/...
+```
 
 Code layout:
 

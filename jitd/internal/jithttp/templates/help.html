@@ -17,8 +17,7 @@
 
 <section class="card prose">
   <h2>From Claude Code or scripts</h2>
-  <p>Install the <b>tailscale-pam</b> plugin (<code>/plugin marketplace add atoonk/tailscale-jit</code>, then <code>/plugin install tailscale-pam@tailscale-jit</code>). Claude then sees what you can reach, lists what you can request, files a request and prints the approval link for you to click.</p>
-  {{with .Data.PluginURL}}<p>The plugin looks for jitd at <code>http://jit</code>, but this server is at <code>{{.}}</code>. Tell the plugin once: run <code>/plugin configure tailscale-pam@tailscale-jit</code> in Claude Code, set <b>jitd URL</b> to <code>{{.}}</code>, and restart Claude Code.</p>{{end}}
+  <p>Connect Claude Code (or any MCP client on the tailnet) to jitd: <code>claude mcp add --transport http --scope user jitd {{.Data.MCPURL}}</code>. Claude then lists what you can request, files a request, prints the approval link for you to click, and waits for the answer; for what this machine can reach now, it runs <code>tailscale service list</code>.</p>
   <p>Claude only asks for what a task needs, and never for longer than the flow allows. You stay in control: the approval link always comes to you.</p>
 </section>
 
@@ -32,7 +31,7 @@
     <li><b>Roles.</b> Admins are set with <code>jitd -admins</code> (logins, <code>group:</code>, <code>tag:</code>). Admins see every request, can decline any pending request and revoke any access. Everyone else sees their own requests and the ones they approve for. Only the requester can cancel a request.</li>
     <li><b>Pending requests</b> expire undecided after the flow's approval timeout (default 24 hours). One live request per flow and device.</li>
     <li><b>Manage.</b> Everything above lives under <a href="/admin">/admin</a>, listed in the <i>Manage</i> section of the sidebar. End users never see that section.</li>
-    <li><b>API.</b> Anything on the tailnet can use the same JSON API the UI and the plugin use: <code>GET /v1/requestable</code> → <code>POST /v1/requests</code> → poll <code>GET /v1/requests/{id}</code>. Callers are identified by their Tailscale connection; there are no tokens. The <a href="/api/docs">interactive API docs</a> describe every endpoint; the raw spec is at <a href="/api/openapi.json"><code>/api/openapi.json</code></a>.</li>
+    <li><b>API.</b> Anything on the tailnet can use the same JSON API the UI uses: <code>GET /v1/requestable</code> → <code>POST /v1/requests</code> → poll <code>GET /v1/requests/{id}</code>. Callers are identified by their Tailscale connection; there are no tokens. The <a href="/api/docs">interactive API docs</a> describe every endpoint; the raw spec is at <a href="/api/openapi.json"><code>/api/openapi.json</code></a>.</li>
   </ul>
 </section>
 {{end}}
@@ -46,7 +45,7 @@
     <tr><td><a href="/requests?scope=mine">My requests</a></td></tr>
     {{if .Admin}}<tr><td><a href="/admin">Admin overview</a></td></tr>
     <tr><td><a href="/api/docs">API documentation</a></td></tr>{{end}}
-    <tr><td><a href="https://github.com/atoonk/tailscale-jit">Source, plugin and README</a></td></tr>
+    <tr><td><a href="https://github.com/atoonk/tailscale-jit">Source and README</a></td></tr>
     {{if .Admin}}<tr><td><a href="https://github.com/atoonk/tailscale-jit/tree/main/jitd">Setting up and running jitd</a></td></tr>{{end}}
     <tr><td><a href="https://tailscale.com/docs/features/device-posture/postures-in-access-rules">Tailscale: postures in access rules</a></td></tr>
     <tr><td><a href="https://tailscale.com/docs/features/tailscale-accessbot-jit#posture-attributes-api-with-expiry">Tailscale: posture attributes API with expiry</a></td></tr>

@@ -39,6 +39,29 @@ type Service struct {
 	mu sync.Mutex
 }
 
+// lockWait bounds the wait for another jitd's state change (see lock). A
+// change holds the lock for at most its Tailscale API calls.
+const lockWait = 2 * apiTimeout
+
+// lock orders state changes: within this jitd (mu), and across every jitd
+// sharing a Postgres database (Store.Lock). It returns the function that
+// releases both. Like the API calls, the wait does not end with the caller's
+// request: a closed browser tab must not abort an approval.
+func (s *Service) lock(ctx context.Context) (unlock func(), err error) {
+	s.mu.Lock()
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lockWait)
+	defer cancel()
+	release, err := s.Store.Lock(ctx)
+	if err != nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("waiting for the database lock: %w", err)
+	}
+	return func() {
+		release()
+		s.mu.Unlock()
+	}, nil
+}
+
 func (s *Service) now() time.Time {
 	if s.Now != nil {
 		return s.Now().UTC()
@@ -76,15 +99,18 @@ func (s *Service) GetWorkflow(id string) (*Workflow, error) {
 
 // CreateWorkflow validates and stores a new workflow.
 func (s *Service) CreateWorkflow(w Workflow) (*Workflow, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lock(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	w.Normalize()
 	if err := w.Validate(); err != nil {
 		return nil, err
 	}
 	now := s.now()
 	w.ID, w.CreatedAt, w.UpdatedAt = NewID("wf_"), now, now
-	err := s.Store.Update(func(d *Data) error {
+	err = s.Store.Update(func(d *Data) error {
 		if err := attributeFree(d, w.Attribute, ""); err != nil {
 			return err
 		}
@@ -99,14 +125,17 @@ func (s *Service) CreateWorkflow(w Workflow) (*Workflow, error) {
 
 // UpdateWorkflow replaces a workflow's editable fields.
 func (s *Service) UpdateWorkflow(id string, w Workflow) (*Workflow, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lock(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	w.Normalize()
 	if err := w.Validate(); err != nil {
 		return nil, err
 	}
 	var out *Workflow
-	err := s.Store.Update(func(d *Data) error {
+	err = s.Store.Update(func(d *Data) error {
 		old, ok := d.Workflows[id]
 		if !ok {
 			return notFound("workflow %q not found", id)
@@ -159,8 +188,12 @@ func OrEmpty[T any](s []T) []T {
 
 // DeleteWorkflow removes a workflow that has no pending or approved requests.
 func (s *Service) DeleteWorkflow(id string) error {
-	s.mu.Lock() // so a Submit cannot slip in between its workflow lookup and its write
-	defer s.mu.Unlock()
+	// so a Submit cannot slip in between its workflow lookup and its write
+	unlock, err := s.lock(context.Background())
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	return s.Store.Update(func(d *Data) error {
 		if _, ok := d.Workflows[id]; !ok {
 			return notFound("workflow %q not found", id)
@@ -428,8 +461,11 @@ const MaxNoteLen = 2000
 
 // Submit files a pending access request for caller.
 func (s *Service) Submit(ctx context.Context, caller Identity, in NewRequest) (*AccessRequest, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	w, err := s.GetWorkflow(in.WorkflowID)
 	if err != nil {
 		return nil, err
@@ -606,8 +642,11 @@ func (s *Service) Approve(ctx context.Context, actor Identity, id, note string) 
 	if err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	r, w, err := s.loadFor(ctx, actor, id)
 	if err != nil {
 		return nil, err
@@ -738,8 +777,11 @@ func (s *Service) Decline(ctx context.Context, actor Identity, id, note string) 
 	if err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	r, w, err := s.loadFor(ctx, actor, id)
 	if err != nil {
 		return nil, err
@@ -773,8 +815,11 @@ func (s *Service) Revoke(ctx context.Context, actor Identity, id, note string) (
 	if err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	r, w, err := s.loadFor(ctx, actor, id)
 	if err != nil {
 		return nil, err
@@ -816,8 +861,11 @@ func (s *Service) Cancel(ctx context.Context, actor Identity, id, note string) (
 	if err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	r, w, err := s.loadFor(ctx, actor, id)
 	if err != nil {
 		return nil, err
@@ -845,11 +893,15 @@ func (s *Service) Cancel(ctx context.Context, actor Identity, id, note string) (
 // device is allowed, so it takes an attribute moved to another flow. The
 // attribute then carries the later expiry already.)
 func (s *Service) ExpireDue() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lock(context.Background())
+	if err != nil {
+		s.Log.Error("expiring requests", "err", err)
+		return 0
+	}
+	defer unlock()
 	now := s.now()
 	var ids []string
-	err := s.Store.Update(func(d *Data) error {
+	err = s.Store.Update(func(d *Data) error {
 		for _, r := range d.Requests {
 			switch {
 			case r.Status == StatusApproved && r.ExpiresAt != nil && !r.ExpiresAt.After(now):
@@ -952,8 +1004,11 @@ func (r *AccessRequest) Unconfirmed(now time.Time) bool {
 // VerifyNow re-reads the device attributes for one request (e.g. when its
 // page is opened and it is not yet confirmed).
 func (s *Service) VerifyNow(ctx context.Context, viewer Identity, id string) (*AccessRequest, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	r, err := s.GetRequest(ctx, viewer, id)
 	if err != nil {
 		return nil, err

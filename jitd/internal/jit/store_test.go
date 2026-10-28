@@ -1,7 +1,6 @@
 package jit
 
 import (
-	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -199,131 +198,6 @@ func TestStoreUpdateErrorRollsBack(t *testing.T) {
 	}
 }
 
-const oldJSON = `{"version":1,
-	"workflows":{"wf_1":{"id":"wf_1","name":"Database (read-only)","attribute":"custom:jit_db_ro"}},
-	"requests":{"req_1":{"id":"req_1","workflow_id":"wf_1","status":"expired",
-		"requester":{"login":"maya@example.com","device_id":"n1"},"created_at":"2026-10-01T12:00:00Z"}}}`
-
-func TestStoreImportsJSON(t *testing.T) {
-	dir := t.TempDir()
-	jsonPath := filepath.Join(dir, "data.json")
-	writeFile(t, jsonPath, oldJSON)
-
-	s, err := Open(jsonPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s.Path != filepath.Join(dir, "data.db") || s.Imported != jsonPath {
-		t.Errorf("path %q, imported %q", s.Path, s.Imported)
-	}
-	if s.Changes() != 0 {
-		t.Errorf("an import counted as %d changes", s.Changes())
-	}
-	if got := queryString(t, s, `SELECT requester || ' ' || created_at FROM requests WHERE id = 'req_1'`); got != "maya@example.com 2026-10-01T12:00:00.000000000Z" {
-		t.Errorf("request row: %q", got)
-	}
-	s.Close()
-	if fi, err := os.Stat(filepath.Join(dir, "data.db")); err != nil || fi.Mode().Perm() != 0o600 {
-		t.Errorf("imported database: %v, %v", fi.Mode(), err)
-	}
-	if exists(filepath.Join(dir, "data.db.importing")) {
-		t.Error("the temporary import database was left behind")
-	}
-
-	// The JSON file is left alone, and the next start uses the database.
-	if b, _ := os.ReadFile(jsonPath); !bytes.Equal(b, []byte(oldJSON)) {
-		t.Error("the JSON file was changed")
-	}
-	writeFile(t, jsonPath, `{"workflows":{}}`)
-	s = openStore(t, jsonPath)
-	if s.Imported != "" || s.Ignored != jsonPath {
-		t.Errorf("imported %q, ignored %q", s.Imported, s.Ignored)
-	}
-	s.View(func(d *Data) {
-		if d.Workflows["wf_1"].Attribute != "custom:jit_db_ro" || d.Requests["req_1"].Status != StatusExpired {
-			t.Errorf("after reopening: %+v", d)
-		}
-	})
-}
-
-func TestStoreUpgradeWithDefaultName(t *testing.T) {
-	// The old default -data was jit-data.json; the new one is jit.db. An
-	// upgrade that keeps the default must not start empty.
-	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, LegacyDataFile), oldJSON)
-	s := openStore(t, filepath.Join(dir, "jit.db"))
-	if s.Imported != filepath.Join(dir, LegacyDataFile) {
-		t.Errorf("imported %q", s.Imported)
-	}
-	s.View(func(d *Data) {
-		if len(d.Workflows) != 1 || len(d.Requests) != 1 {
-			t.Errorf("imported %d flows and %d requests", len(d.Workflows), len(d.Requests))
-		}
-	})
-
-	// Any other name starts empty.
-	other := openStore(t, filepath.Join(dir, "other.db"))
-	if other.Imported != "" {
-		t.Error("other.db imported jit-data.json")
-	}
-}
-
-func TestStoreInterruptedImport(t *testing.T) {
-	dir := t.TempDir()
-	jsonPath := filepath.Join(dir, "data.json")
-	writeFile(t, jsonPath, oldJSON)
-	// What a crash during the import leaves: only the temporary database.
-	writeFile(t, filepath.Join(dir, "data.db.importing"), "")
-	writeFile(t, filepath.Join(dir, "data.db.importing-wal"), "partial")
-
-	s := openStore(t, jsonPath)
-	if s.Imported != jsonPath {
-		t.Fatal("did not import after an interrupted import")
-	}
-	s.View(func(d *Data) {
-		if len(d.Workflows) != 1 {
-			t.Errorf("imported %d flows", len(d.Workflows))
-		}
-	})
-	entries, _ := os.ReadDir(dir)
-	for _, e := range entries {
-		if strings.Contains(e.Name(), "importing") {
-			t.Errorf("left behind: %s", e.Name())
-		}
-	}
-}
-
-func TestStoreBadImports(t *testing.T) {
-	for name, content := range map[string]string{
-		"corrupt":      "{not json",
-		"null request": `{"requests":{"req_1":null}}`,
-		"id mismatch":  `{"workflows":{"wf_1":{"id":"wf_2"}}}`,
-		"empty id":     `{"requests":{"":{"id":""}}}`,
-		"newer":        `{"version":2}`,
-	} {
-		t.Run(name, func(t *testing.T) {
-			dir := t.TempDir()
-			path := filepath.Join(dir, "jit.json")
-			writeFile(t, path, content)
-			if _, err := Open(path); err == nil {
-				t.Fatal("expected an error")
-			}
-			if entries, _ := os.ReadDir(dir); len(entries) != 1 {
-				t.Errorf("a failed import left files behind: %v", entries)
-			}
-		})
-	}
-
-	// A .json that isn't there is a mistake, not a new install.
-	dir := t.TempDir()
-	if _, err := Open(filepath.Join(dir, "typo.json")); err == nil || !strings.Contains(err.Error(), "nothing to import") {
-		t.Errorf("err = %v", err)
-	}
-	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
-		t.Errorf("left behind: %v", entries)
-	}
-}
-
 func TestStoreRefusesOtherFiles(t *testing.T) {
 	dir := t.TempDir()
 
@@ -406,7 +280,7 @@ func TestStoreReadOnly(t *testing.T) {
 		return nil
 	})
 	s.Close()
-	ro, err := OpenReadOnly(filepath.Join(dir, "jit.json")) // a .json name finds its .db
+	ro, err := OpenReadOnly(filepath.Join(dir, "jit.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
